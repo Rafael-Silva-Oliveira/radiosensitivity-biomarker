@@ -38,9 +38,6 @@ FIG_DIR  = BASE_DIR / "figures"
 DATA_DIR.mkdir(exist_ok=True)
 FIG_DIR.mkdir(exist_ok=True)
 
-# Explicit light-theme style so plots look correct both when saved to file
-# and when displayed interactively (VS Code, Jupyter). Without these, a dark
-# IDE theme can inherit dark rcParams that make text/legends invisible.
 plt.rcParams.update({
     "figure.figsize":       (8, 5),
     "figure.dpi":           150,
@@ -58,22 +55,23 @@ plt.rcParams.update({
     "savefig.edgecolor":    "white",
 })
 
-# ── constants ──────────────────────────────────────────────────────────────────
+# ── constants that we can change lter ──────────────────────────────────────────────────────────────────
 GEO_ID     = "GSE190826"
 RAW_TAR_URL = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE190nnn/GSE190826/suppl/GSE190826_RAW.tar"
 
-N_FRACTIONS  = 28       # 50.4 Gy / 28 fx = 1.8 Gy per fraction (standard long-course rectal CRT)
+N_FRACTIONS  = 28       # 50.4 Gy / 28 fx = 1.8 Gy per fraction
 TOTAL_DOSE   = 50.4     # Gy
 DOSE_PER_FX  = TOTAL_DOSE / N_FRACTIONS  # = 1.8 Gy
 
 BETA    = 0.05          # fixed LQ beta (Gy^-2), Scott 2017
 D_ALPHA = 2.0           # SF2-assay reference dose for alpha derivation (Gy)
 
+# Even though this study only has a 1 arm delivered dose, we will establish a upper and lower interval just to see how we could evaluate RxRSI in a multi-arm study, if that was the case.
 SOC_LOW  = 45.0         # Gy  -- lower edge of rectal neoadjuvant SOC
 SOC_HIGH = 54.0         # Gy  -- upper edge
 SOC_REF  = 50.4         # Gy  -- delivered to all patients in this cohort
 
-# RSI 10-gene coefficients -- Scott et al. 2017
+# RSI 10-gene coefficients -- Check out the paper from Scott et al. 2017
 RSI_COEFFS = {
     "AR":    -0.0098009,
     "JUN":    0.0128283,
@@ -88,7 +86,7 @@ RSI_COEFFS = {
 }
 RSI_GENES = list(RSI_COEFFS.keys())
 
-# GRCh38 Ensembl IDs for the 10 RSI genes (featureCounts files use Ensembl IDs)
+# GRCh38 Ensembl IDs for the 10 RSI genes (featureCounts files use Ensembl IDs). Since its not many genes, we can use something like https://www.syngoportal.org/convert to conver from Ensembl to HGNC symbols
 RSI_ENSEMBL = {
     "AR":    "ENSG00000169083",
     "JUN":   "ENSG00000177606",
@@ -113,7 +111,7 @@ RXRSI_COLORS = {
 RXRSI_ORDER = ["Radiosensitive", "Intermediate", "Radioresistant"]
 
 # %%
-# ── 1. Fetch GSE190826 ─────────────────────────────────────────────────────────
+# ── 1. Getting the dataset GSE190826 ─────────────────────────────────────────────────────────
 print("=== 1. Fetching GSE190826 ===")
 
 counts_cache = DATA_DIR / "gse190826_counts.csv"
@@ -152,7 +150,7 @@ else:
 
     counts_df = pd.DataFrame(count_cols).T
     counts_df.index.name = "sample_id"
-    # Columns are Ensembl IDs; rename the 10 RSI genes to HGNC symbols for convenience
+    # Columns are Ensembl IDs; gotta rename the 10 RSI genes to HGNC symbols for convenience
     counts_df.rename(columns=ENSEMBL_TO_SYMBOL, inplace=True)
 
     # GEO metadata: DFS time/event + pCR + treatment
@@ -180,7 +178,7 @@ print(f"  Metadata columns: {list(meta_df.columns)}")
 # ── 2. Keep only pre-CRT biopsies ─────────────────────────────────────────────
 print("\n=== 2. Filtering to pre-CRT samples ===")
 
-# The dataset has both pre-CRT and post-CRT samples; RSI is computed on baseline
+# The dataset has both pre-CRT and post-CRT samples; RSI is computed on baseline (ITT - intent to treat samples)
 pre_mask = meta_df["time"].str.strip().str.lower() == "pre-crt"
 meta_df  = meta_df[pre_mask].copy()
 shared   = counts_df.index.intersection(meta_df.index)
@@ -225,16 +223,15 @@ print(f"  Response: {adata.obs['response'].value_counts().to_dict()}")
 
 TIME_COL  = "dfs_months"
 EVENT_COL = "dfs_event"
-survival_available = adata.obs[TIME_COL].notna().sum() >= 20
 
 
 # %% 4. Normalize (CPM)
 # ── 4. Normalize: raw counts -> CPM ───────────────────────────────────────────
 print("\n=== 4. Normalizing (CPM) ===")
 
-raw = adata.layers["raw_counts"]
+raw = adata.layers["raw_counts"].copy()
 cpm = CPM().fit_transform(raw)
-adata.layers["cpm"]     = cpm
+adata.layers["cpm"]     = cpm.copy()
 adata.layers["log_cpm"] = np.log1p(cpm)
 
 print("  Layers: raw_counts | cpm | log_cpm")
@@ -245,9 +242,12 @@ print("  Layers: raw_counts | cpm | log_cpm")
 print("\n=== 5. Computing RSI ===")
 
 # Steps (Scott 2017 + reference implementation):
-#   1. Rank all genes by log-CPM within each sample (descending = rank 1 is highest expr)
-#   2. Extract the 10 RSI genes and re-rank them among themselves (relative ranks 1-10)
-#   3. RSI = weighted sum of relative ranks, clipped to [0, 1]
+#   1. Order all genes by log-CPM within each sample (just to get a within-sample
+#      ordering; this intermediate position is NOT the rank used in the formula).
+#   2. Extract the 10 RSI genes and re-rank them AMONG THEMSELVES into relative
+#      ranks 1..10, where the HIGHEST-expressed RSI gene = 10 and the lowest = 1
+#      (matching Scott 2017: highest expression -> rank 10).
+#   3. RSI = weighted sum of those relative ranks, clipped to [0, 1].
 
 missing = [g for g in RSI_GENES if g not in adata.var_names]
 present = [g for g in RSI_GENES if g in adata.var_names]
@@ -261,17 +261,20 @@ rsi_scores = []
 for i in range(adata.n_obs):
     sample_expr = log_cpm[i, :]
 
-    # Global rank (1 = highest expression in that sample)
+    # Intermediate within-sample ordering position. We assign position 1 to the
+    # highest-expressed gene purely as a sorting key; this is NOT the rank that
+    # enters RSI (that is computed in the re-ranking step below).
     global_order    = np.argsort(sample_expr)[::-1]
     global_rank_pos = np.empty(len(sample_expr), dtype=float)
     global_rank_pos[global_order] = np.arange(1, len(sample_expr) + 1)
 
-    # Extract positions for the 10 RSI genes
+    # Ordering position of each of the 10 RSI genes
     gene_positions = {g: global_rank_pos[np.where(var_names == g)[0][0]] for g in present}
 
-    # Re-rank among themselves: sort ascending by global rank position so that
-    # the highest-expressed gene (smallest global rank position) gets the highest
-    # relative rank (= len(present)), matching the reference np.arange(N, 0, -1).
+    # Re-rank the RSI genes AMONG THEMSELVES (the relative rank from scott 2017). sorted_genes is ordered from highest
+    # to lowest expression (smallest ordering position first), so the highest-
+    # expressed gene (r=0) gets relative rank n_present (=10), and the lowest
+    # (r=n_present-1) gets relative rank 1 -- i.e. highest expression -> rank 10
     sorted_genes   = sorted(gene_positions, key=lambda g: gene_positions[g])
     n_present      = len(sorted_genes)
     relative_ranks = {g: n_present - r for r, g in enumerate(sorted_genes)}
@@ -328,76 +331,38 @@ rsi_arr = np.where(rsi_arr <= 0, 1e-4, rsi_arr)
 
 alpha = (np.log(rsi_arr) + BETA * D_ALPHA**2) / (-D_ALPHA)
 gard  = N_FRACTIONS * DOSE_PER_FX * (alpha + BETA * DOSE_PER_FX)
-gard  = np.clip(gard, 1, 100)
+gard  = np.clip(gard, 1, 100) # lets clip the values, although we can use them unclipped.
 
 adata.obs["GARD"]  = gard
 adata.obs["alpha"] = alpha
 print(f"  GARD range: [{gard.min():.2f}, {gard.max():.2f}]  median: {np.median(gard):.2f}")
 
 
-# %% 8. Dichotomize GARD (median + maxstat + tertiles)
+# %% 8. Dichotomize GARD (median + maxstat)
 # ── 8. Dichotomize GARD: median split + maxstat ───────────────────────────────
 print("\n=== 8. Dichotomizing GARD ===")
 
-# Derive a balanced cutpoint window: find the tightest [lo, hi] such that any
-# split at a value inside the window guarantees >= MIN_GROUP_PCT of patients in
-# each group. This is more principled than fixed percentile bounds — it directly
-# enforces balance rather than using a proxy. The same window is applied to the
-# median, tertile, and maxstat searches so all three are consistent.
-# Motivation: splitting near the extremes inflates the log-rank statistic because
-# a tiny group separates easily by chance (Lausen & Schumacher 1992).
-MIN_GROUP_PCT = 0.25   # each group must contain at least 25% of patients
-n_total = len(gard)
-min_n   = int(np.ceil(MIN_GROUP_PCT * n_total))
-
-# lo = smallest GARD value such that (gard < lo).sum() >= min_n
-# hi = largest  GARD value such that (gard >= hi).sum() >= min_n
-gard_sorted = np.sort(gard)
-lo_cut = float(gard_sorted[min_n])       # at least min_n patients below this
-hi_cut = float(gard_sorted[n_total - min_n - 1])  # at least min_n patients at/above this
-gard_trimmed = gard[(gard >= lo_cut) & (gard <= hi_cut)]
-pct_lo = (gard < lo_cut).mean() * 100
-pct_hi = (gard >= hi_cut).mean() * 100
-print(f"  Balanced window (>={int(MIN_GROUP_PCT*100)}% per group): "
-      f"[{lo_cut:.2f}, {hi_cut:.2f}]  "
-      f"(bottom {pct_lo:.0f}% / top {pct_hi:.0f}% excluded; "
-      f"{len(gard_trimmed)}/{n_total} samples in window)")
-
-# Median split — within the balanced window.
-gard_median = float(np.median(gard_trimmed))
+# Median split
+gard_median = float(np.median(gard))
 adata.obs["GARD_cat_median"] = np.where(gard >= gard_median, "High", "Low")
 print(f"  Median cutpoint: {gard_median:.2f}  "
       f"groups: {adata.obs['GARD_cat_median'].value_counts().to_dict()}")
 
-# Tertile split — within the balanced window.
-t33, t67 = np.percentile(gard_trimmed, [33.3, 66.7])
-adata.obs["GARD_tertile"] = pd.cut(
-    adata.obs["GARD"], bins=[-np.inf, t33, t67, np.inf],
-    labels=["Low", "Intermediate", "High"],
-).astype(str)
-print(f"  Tertile cuts: T33={t33:.2f}  T67={t67:.2f}")
 
-
-def maxstat_2g(gard_vals, time_vals, event_vals, lo, hi):
-    """
-    Scan log-rank chi² over candidate cutpoints within [lo, hi] — the
-    pre-computed balanced window where every split has >= MIN_GROUP_PCT patients
-    in each group. BH-FDR corrects for the multiple comparisons across cutpoints.
-    Returns (best_cut, chi2_array, candidates_array, bh_corrected_p).
-    """
+def maxstat_2g(gard_vals, time_vals, event_vals, pct_window=(33, 75)):
+    """Scan log-rank chi2 over candidate GARD cutpoints and return the one that
+    maximizes it, with BH-FDR correction across the scan. We restrict the search to
+    the central `pct_window` percentiles of GARD so that neither group becomes a tiny
+    extreme -- splitting near the tails inflates the statistic by chance (Lausen &
+    Schumacher 1992)."""
+    lo, hi = np.percentile(gard_vals, pct_window)
     candidates = np.unique(gard_vals[(gard_vals >= lo) & (gard_vals <= hi)])
     chi2_vals, pvals = [], []
     for cut in candidates:
         g_hi = gard_vals >= cut
-        g_lo = ~g_hi
-        if g_hi.sum() < min_n or g_lo.sum() < min_n:
-            chi2_vals.append(0.0); pvals.append(1.0)
-            continue
-        r = logrank_test(
-            time_vals[g_hi], time_vals[g_lo],
-            event_observed_A=event_vals[g_hi],
-            event_observed_B=event_vals[g_lo],
-        )
+        r = logrank_test(time_vals[g_hi], time_vals[~g_hi],
+                         event_observed_A=event_vals[g_hi],
+                         event_observed_B=event_vals[~g_hi])
         chi2_vals.append(r.test_statistic)
         pvals.append(r.p_value)
     chi2_arr = np.array(chi2_vals)
@@ -406,33 +371,25 @@ def maxstat_2g(gard_vals, time_vals, event_vals, lo, hi):
     return candidates[best_idx], chi2_arr, candidates, bh_pvals[best_idx]
 
 
-maxstat_cut = gard_median  # fallback if no survival data
-maxstat_bh_p = np.nan
+obs_s = adata.obs[[TIME_COL, EVENT_COL, "GARD"]].dropna()
+obs_s = obs_s[obs_s[TIME_COL] > 0]
+maxstat_cut, chi2_arr, cut_arr, maxstat_bh_p = maxstat_2g(
+    obs_s["GARD"].values, obs_s[TIME_COL].values, obs_s[EVENT_COL].values)
+maxstat_pct = float(np.mean(gard < maxstat_cut) * 100)
+print(f"  Maxstat cutpoint: {maxstat_cut:.2f} Gy "
+      f"(~{maxstat_pct:.0f}th percentile of GARD)  BH-p: {maxstat_bh_p:.4f}")
 
-if survival_available:
-    obs_s = adata.obs[[TIME_COL, EVENT_COL, "GARD"]].dropna()
-    obs_s = obs_s[obs_s[TIME_COL] > 0]
-    if len(obs_s) >= 20:
-        maxstat_cut, chi2_arr, cut_arr, maxstat_bh_p = maxstat_2g(
-            obs_s["GARD"].values, obs_s[TIME_COL].values, obs_s[EVENT_COL].values,
-            lo=lo_cut, hi=hi_cut)
-        maxstat_pct = float(np.mean(obs_s["GARD"].values < maxstat_cut) * 100)
-        print(f"  Maxstat cutpoint: {maxstat_cut:.2f} Gy  "
-              f"(sits at ~{maxstat_pct:.0f}th percentile of full GARD distribution; "
-              f"search window was [{lo_cut:.2f}, {hi_cut:.2f}])  BH-p: {maxstat_bh_p:.4f}")
-
-        fig, ax = plt.subplots()
-        ax.plot(cut_arr, chi2_arr, color="#4878d0")
-        ax.axvline(maxstat_cut, color="red", linestyle="--",
-                   label=f"Optimal cut = {maxstat_cut:.1f} (~{maxstat_pct:.0f}th pct)")
-        ax.set_xlabel("GARD cutpoint")
-        ax.set_ylabel("Log-rank chi2")
-        ax.set_title("Maxstat scan -- GARD vs DFS")
-        ax.legend()
-        plt.tight_layout()
-        fig.savefig(FIG_DIR / "maxstat_scan.png")
-        plt.close()
-        print("  Saved: maxstat_scan.png")
+fig, ax = plt.subplots()
+ax.plot(cut_arr, chi2_arr, color="#4878d0")
+ax.axvline(maxstat_cut, color="red", linestyle="--",
+           label=f"Optimal cut = {maxstat_cut:.1f} (~{maxstat_pct:.0f}th pct)")
+ax.set_xlabel("GARD cutpoint")
+ax.set_ylabel("Log-rank chi2")
+ax.set_title("Maxstat scan -- GARD vs DFS")
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIG_DIR / "maxstat_scan.png")
+plt.close()
 
 adata.obs["GARD_cat_maxstat"] = np.where(gard >= maxstat_cut, "High", "Low")
 print(f"  Maxstat groups: {adata.obs['GARD_cat_maxstat'].value_counts().to_dict()}")
@@ -489,217 +446,99 @@ print("  Saved: gard_vs_rsi_scatter.png")
 # ── 9. Cox modelling ───────────────────────────────────────────────────────────
 print("\n=== 9. Cox modelling ===")
 
-if not survival_available:
-    print("  No survival data -- skipping Cox models")
-else:
-    obs_cox = adata.obs.copy()
-    obs_cox = obs_cox[obs_cox[TIME_COL] > 0].dropna(subset=[TIME_COL, EVENT_COL])
+# Build the modelling table: z-score the continuous predictors, binarize the
+# categorical GARD splits, and encode pCR as the one clinical covariate we have.
+obs_cox = adata.obs[adata.obs[TIME_COL] > 0].dropna(subset=[TIME_COL, EVENT_COL]).copy()
+obs_cox["RSI_z"]                = zscore(obs_cox["RSI"],  nan_policy="omit")
+obs_cox["GARD_z"]               = zscore(obs_cox["GARD"], nan_policy="omit")
+obs_cox["GARD_cat_median_bin"]  = (obs_cox["GARD_cat_median"]  == "High").astype(int)
+obs_cox["GARD_cat_maxstat_bin"] = (obs_cox["GARD_cat_maxstat"] == "High").astype(int)
+obs_cox["pcr_bin"]              = (obs_cox["response"].str.strip().str.lower() == "pcr").astype(int)
 
-    obs_cox["RSI_z"]              = zscore(obs_cox["RSI"],  nan_policy="omit")
-    obs_cox["GARD_z"]             = zscore(obs_cox["GARD"], nan_policy="omit")
-    obs_cox["GARD_cat_median_bin"]  = (obs_cox["GARD_cat_median"]  == "High").astype(int)
-    obs_cox["GARD_cat_maxstat_bin"] = (obs_cox["GARD_cat_maxstat"] == "High").astype(int)
 
-    # Encode pCR as binary covariate
-    obs_cox["pcr_bin"] = (obs_cox["response"].str.strip().str.lower() == "pcr").astype(int)
+def fit_cox(cols, label):
+    """Fit a Cox model on `cols` (first column is the predictor of interest) and
+    return its hazard ratio, 95% CI, p-value, and concordance."""
+    sub = obs_cox[cols + [TIME_COL, EVENT_COL]]
+    cph = CoxPHFitter(penalizer=0.1)
+    cph.fit(sub, duration_col=TIME_COL, event_col=EVENT_COL)
+    row = cph.summary.loc[cols[0]]
+    return {
+        "model": label, "predictor": cols[0],
+        "HR":       round(float(np.exp(row["coef"])), 3),
+        "HR_lower": round(float(np.exp(row["coef lower 95%"])), 3),
+        "HR_upper": round(float(np.exp(row["coef upper 95%"])), 3),
+        "p":        round(float(row["p"]), 4),
+        "c_index":  round(float(cph.concordance_index_), 3),
+    }
 
-    # Detect any other clinical covariates available in obs
-    candidate_covars = ["age", "sex", "gender", "pcr_bin"]
-    available_covars = [c for c in candidate_covars if c in obs_cox.columns]
-    print(f"  Clinical covariates: {available_covars}")
 
-    cox_results = []
+predictors = ["RSI_z", "GARD_z", "GARD_cat_median_bin", "GARD_cat_maxstat_bin"]
+cox_results = []
+for pred in predictors:                              # univariate
+    cox_results.append(fit_cox([pred], f"Univariate: {pred}"))
+for pred in predictors:                              # adjusted for pCR
+    cox_results.append(fit_cox([pred, "pcr_bin"], f"Multivariate: {pred}"))
 
-    def fit_cox(df, cols, label):
-        sub = df[cols + [TIME_COL, EVENT_COL]].dropna()
-        if len(sub) < 15:
-            return None
-        sub = pd.get_dummies(sub, drop_first=True)
-        cph = CoxPHFitter(penalizer=0.1)
-        try:
-            cph.fit(sub, duration_col=TIME_COL, event_col=EVENT_COL, show_progress=False)
-        except Exception as e:
-            print(f"    WARN {label}: {e}")
-            return None
-        import contextlib, io as _io
-        with contextlib.redirect_stdout(_io.StringIO()):
-            ph_warnings = cph.check_assumptions(sub, p_value_threshold=0.05, show_plots=False)
-        primary = cols[0]
-        coef_row = next(
-            (cph.summary.loc[idx] for idx in cph.summary.index if primary in str(idx)),
-            cph.summary.iloc[0],
-        )
-        return {
-            "model":    label,
-            "n":        len(sub),
-            "predictor": primary,
-            "HR":       round(float(np.exp(coef_row["coef"])), 3),
-            "HR_lower": round(float(np.exp(coef_row["coef lower 95%"])), 3),
-            "HR_upper": round(float(np.exp(coef_row["coef upper 95%"])), 3),
-            "p":        round(float(coef_row["p"]), 4),
-            "c_index":  round(float(cph.concordance_index_), 3),
-            "AIC":      round(float(cph.AIC_partial_), 1),
-            "ph_warning": bool(ph_warnings),
-        }
+cox_df = pd.DataFrame(cox_results)
+cox_df.to_csv(DATA_DIR / "cox_results.csv", index=False)
+for r in cox_results:
+    print(f"  {r['model']}: HR={r['HR']} [{r['HR_lower']}-{r['HR_upper']}]  p={r['p']}  C={r['c_index']}")
 
-    predictors = ["RSI_z", "GARD_z", "GARD_cat_median_bin", "GARD_cat_maxstat_bin"]
 
-    for pred in predictors:
-        res = fit_cox(obs_cox, [pred], f"Univariate: {pred}")
-        if res:
-            cox_results.append(res)
-            print(f"  {res['model']}: HR={res['HR']} [{res['HR_lower']}-{res['HR_upper']}]  "
-                  f"p={res['p']}  C={res['c_index']}")
+def forest_plot(df, title, outpath, color):
+    fig, ax = plt.subplots(figsize=(7, max(3, len(df) * 0.8)))
+    y = range(len(df))
+    ax.scatter(df["HR"], y, color=color, zorder=3, s=60)
+    ax.hlines(y, df["HR_lower"], df["HR_upper"], color=color, linewidth=2)
+    ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8)
+    ax.set_yticks(list(y)); ax.set_yticklabels(df["predictor"].tolist())
+    ax.set_xlabel("Hazard Ratio (95% CI)"); ax.set_title(title)
+    plt.tight_layout(); fig.savefig(outpath); plt.close()
 
-    for pred in predictors:
-        cols = [pred] + available_covars
-        res = fit_cox(obs_cox, cols, f"Multivariate: {pred}")
-        if res:
-            cox_results.append(res)
-            print(f"  {res['model']}: HR={res['HR']} [{res['HR_lower']}-{res['HR_upper']}]  "
-                  f"p={res['p']}  C={res['c_index']}  PH_warn={res['ph_warning']}")
-
-    cox_df = pd.DataFrame(cox_results)
-    cox_df.to_csv(DATA_DIR / "cox_results.csv", index=False)
-    print("  Saved: cox_results.csv")
-
-    def forest_plot(df, title, outpath, color):
-        if df.empty:
-            return
-        fig, ax = plt.subplots(figsize=(7, max(3, len(df) * 0.8)))
-        y = list(range(len(df)))
-        ax.scatter(df["HR"].values, y, color=color, zorder=3, s=60)
-        for i, (_, row) in enumerate(df.iterrows()):
-            ax.hlines(i, row["HR_lower"], row["HR_upper"], color=color, linewidth=2)
-        ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8)
-        ax.set_yticks(y)
-        ax.set_yticklabels(df["predictor"].tolist())
-        ax.set_xlabel("Hazard Ratio (95% CI)")
-        ax.set_title(title)
-        plt.tight_layout()
-        fig.savefig(outpath)
-        plt.close()
-
-    forest_plot(
-        cox_df[cox_df["model"].str.startswith("Univariate")],
-        "Univariate Cox -- DFS", FIG_DIR / "forest_univariate.png", "#4878d0",
-    )
-    forest_plot(
-        cox_df[cox_df["model"].str.startswith("Multivariate")],
-        "Multivariate Cox -- DFS", FIG_DIR / "forest_multivariate.png", "#ee854a",
-    )
-    print("  Saved: forest_univariate.png, forest_multivariate.png")
+forest_plot(cox_df[cox_df["model"].str.startswith("Univariate")],
+            "Univariate Cox -- DFS", FIG_DIR / "forest_univariate.png", "#4878d0")
+forest_plot(cox_df[cox_df["model"].str.startswith("Multivariate")],
+            "Multivariate Cox -- DFS", FIG_DIR / "forest_multivariate.png", "#ee854a")
+print("  Saved: cox_results.csv, forest_univariate.png, forest_multivariate.png")
 
 
 # %% 10. Kaplan-Meier plots
 # ── 10. Kaplan-Meier plots ────────────────────────────────────────────────────
 print("\n=== 10. Kaplan-Meier plots ===")
 
-GROUP_COLORS_2 = {"High": "#2ca02c", "Low": "#d62728"}
-TERTILE_COLORS = {"Low": "#d62728", "Intermediate": "#E6A817", "High": "#2ca02c"}
-
-
-def plot_km_2group(obs_df, group_col, t_col, e_col, title, outpath, colors=None):
-    colors = colors or GROUP_COLORS_2
-    df = obs_df[[group_col, t_col, e_col]].copy()
-    df[t_col] = pd.to_numeric(df[t_col], errors="coerce")
-    df[e_col] = pd.to_numeric(df[e_col], errors="coerce")
-    df = df.dropna()
-    df = df[df[t_col] > 0]
-    if len(df) < 10:
-        return
+def plot_km_2group(group_col, title, outpath, colors):
+    """Plot Kaplan-Meier DFS curves for the two groups in `group_col`, annotated
+    with the log-rank p-value between them."""
+    df = adata.obs[[group_col, TIME_COL, EVENT_COL]].dropna()
+    df = df[df[TIME_COL] > 0]
     fig, ax = plt.subplots(figsize=(8, 5))
     kmf = KaplanMeierFitter()
-    grps = sorted(df[group_col].dropna().unique(), reverse=True)  # High first
-    for grp in grps:
+    grp_a, grp_b = sorted(df[group_col].unique(), reverse=True)  # High/pCR first
+    for grp in (grp_a, grp_b):
         mask = df[group_col] == grp
-        if mask.sum() < 5:
-            continue
-        kmf.fit(df.loc[mask, t_col], df.loc[mask, e_col], label=grp)
-        kmf.plot_survival_function(ax=ax, color=colors.get(grp, "grey"), ci_show=True)
+        kmf.fit(df.loc[mask, TIME_COL], df.loc[mask, EVENT_COL], label=grp)
+        kmf.plot_survival_function(ax=ax, color=colors[grp], ci_show=True)
 
-    # Log-rank p between the two extremes
-    grp_a = "High" if "High" in grps else grps[0]
-    grp_b = "Low" if "Low" in grps else grps[-1]
-    if (df[group_col] == grp_a).sum() >= 5 and (df[group_col] == grp_b).sum() >= 5:
-        lr = logrank_test(
-            df.loc[df[group_col] == grp_a, t_col],
-            df.loc[df[group_col] == grp_b, t_col],
-            event_observed_A=df.loc[df[group_col] == grp_a, e_col],
-            event_observed_B=df.loc[df[group_col] == grp_b, e_col],
-        )
-        ax.text(0.05, 0.05, f"log-rank p = {lr.p_value:.4f}",
-                transform=ax.transAxes, fontsize=10)
+    lr = logrank_test(
+        df.loc[df[group_col] == grp_a, TIME_COL], df.loc[df[group_col] == grp_b, TIME_COL],
+        event_observed_A=df.loc[df[group_col] == grp_a, EVENT_COL],
+        event_observed_B=df.loc[df[group_col] == grp_b, EVENT_COL])
+    ax.text(0.05, 0.05, f"log-rank p = {lr.p_value:.4f}", transform=ax.transAxes, fontsize=10)
 
-    ax.set_xlabel("Time (months)")
-    ax.set_ylabel("DFS probability")
-    ax.set_title(title)
-    ax.set_ylim(0, 1.05)
-    plt.tight_layout()
-    fig.savefig(outpath)
-    plt.close()
+    ax.set_xlabel("Time (months)"); ax.set_ylabel("DFS probability")
+    ax.set_title(title); ax.set_ylim(0, 1.05)
+    plt.tight_layout(); fig.savefig(outpath); plt.close()
 
 
-def plot_km_3group(obs_df, group_col, t_col, e_col, title, outpath, colors):
-    df = obs_df[[group_col, t_col, e_col]].copy()
-    df[t_col] = pd.to_numeric(df[t_col], errors="coerce")
-    df[e_col] = pd.to_numeric(df[e_col], errors="coerce")
-    df = df.dropna()
-    df = df[df[t_col] > 0]
-    if len(df) < 15:
-        return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    kmf = KaplanMeierFitter()
-    for grp in ["High", "Intermediate", "Low"]:
-        mask = df[group_col] == grp
-        if mask.sum() < 5:
-            continue
-        kmf.fit(df.loc[mask, t_col], df.loc[mask, e_col], label=grp)
-        kmf.plot_survival_function(ax=ax, color=colors.get(grp, "grey"), ci_show=True)
-    # Log-rank between High and Low
-    hi = df[group_col] == "High"
-    lo = df[group_col] == "Low"
-    if hi.sum() >= 5 and lo.sum() >= 5:
-        lr = logrank_test(
-            df.loc[hi, t_col], df.loc[lo, t_col],
-            event_observed_A=df.loc[hi, e_col], event_observed_B=df.loc[lo, e_col],
-        )
-        ax.text(0.05, 0.05, f"High vs Low log-rank p = {lr.p_value:.4f}",
-                transform=ax.transAxes, fontsize=10)
-    ax.set_xlabel("Time (months)")
-    ax.set_ylabel("DFS probability")
-    ax.set_title(title)
-    ax.set_ylim(0, 1.05)
-    plt.tight_layout()
-    fig.savefig(outpath)
-    plt.close()
-
-
-if not survival_available:
-    print("  No survival data -- KM plots skipped")
-else:
-    plot_km_2group(adata.obs, "GARD_cat_median", TIME_COL, EVENT_COL,
-                   f"DFS -- GARD median split (cut={gard_median:.1f})",
-                   FIG_DIR / "km_dfs_gard_median.png")
-    print("  Saved: km_dfs_gard_median.png")
-
-    plot_km_2group(adata.obs, "GARD_cat_maxstat", TIME_COL, EVENT_COL,
-                   f"DFS -- GARD maxstat split (cut={maxstat_cut:.1f})",
-                   FIG_DIR / "km_dfs_gard_maxstat.png")
-    print("  Saved: km_dfs_gard_maxstat.png")
-
-    plot_km_3group(adata.obs, "GARD_tertile", TIME_COL, EVENT_COL,
-                   f"DFS -- GARD tertile split (T33={t33:.1f}, T67={t67:.1f})",
-                   FIG_DIR / "km_dfs_gard_tertile.png",
-                   colors=TERTILE_COLORS)
-    print("  Saved: km_dfs_gard_tertile.png")
-
-    # KM by pCR response
-    plot_km_2group(adata.obs, "response", TIME_COL, EVENT_COL,
-                   "DFS -- pCR vs non-pCR",
-                   FIG_DIR / "km_dfs_response.png",
-                   colors={"pCR": "#2ca02c", "Non-pCR": "#d62728"})
-    print("  Saved: km_dfs_response.png")
+GARD_COLORS = {"High": "#2ca02c", "Low": "#d62728"}
+plot_km_2group("GARD_cat_median", f"DFS -- GARD median split (cut={gard_median:.1f})",
+               FIG_DIR / "km_dfs_gard_median.png", GARD_COLORS)
+plot_km_2group("GARD_cat_maxstat", f"DFS -- GARD maxstat split (cut={maxstat_cut:.1f})",
+               FIG_DIR / "km_dfs_gard_maxstat.png", GARD_COLORS)
+plot_km_2group("response", "DFS -- pCR vs non-pCR",
+               FIG_DIR / "km_dfs_response.png", {"pCR": "#2ca02c", "Non-pCR": "#d62728"})
+print("  Saved: km_dfs_gard_median.png, km_dfs_gard_maxstat.png, km_dfs_response.png")
 
 
 # %% 11. Compute RxRSI
@@ -707,14 +546,16 @@ else:
 print("\n=== 11. Computing RxRSI ===")
 
 # GARD_T = maxstat cutpoint (or median fallback).
-# RxRSI = quadratic inversion: given a target GARD, what total dose does each patient need?
+# RxRSI = the physical dose needed to reach the target GARD_T for each patient.
+#   RxRSI = GARD_T / (alpha + beta * d)   [Scott 2021, eq 4]
+# alpha is the patient-specific linear LQ parameter derived from RSI (computed in
+# step 7); d is the dose per fraction. Lower alpha (radioresistant tumour) -> larger
+# required dose. We guard against alpha + beta*d <= 0 (would give a non-physical dose).
 GARD_T = maxstat_cut if not np.isnan(maxstat_cut) else gard_median
 print(f"  Target GARD (GARD_T): {GARD_T:.2f}")
 
-n = float(N_FRACTIONS)
-disc  = alpha**2 + 4.0 * BETA * GARD_T / n
-disc  = np.where(disc < 0, np.nan, disc)
-rxrsi = (-alpha + np.sqrt(disc)) / (2.0 * BETA / n)
+denom = alpha + BETA * DOSE_PER_FX
+rxrsi = np.where(denom > 0, GARD_T / denom, np.inf)
 rxrsi = np.where(np.isnan(rxrsi) | (rxrsi <= 0), np.inf, rxrsi)
 
 adata.obs["RxRSI"] = rxrsi
@@ -759,11 +600,13 @@ fig, ax = plt.subplots(figsize=(10, 7))
 
 rsi_grid   = np.linspace(0.01, 0.99, 300)
 alpha_grid = (np.log(rsi_grid) + BETA * D_ALPHA**2) / (-D_ALPHA)
-for n_fx, ls in [(20, "--"), (28, "-"), (35, ":")]:
-    disc_c = np.clip(alpha_grid**2 + 4.0 * BETA * GARD_T / n_fx, 0, None)
-    rx_c   = (-alpha_grid + np.sqrt(disc_c)) / (2.0 * BETA / n_fx)
+# RxRSI = GARD_T / (alpha + beta*d); the curve shape depends on the dose per
+# fraction d, so we draw it for a few representative fractionations.
+for d_fx, ls in [(1.5, "--"), (1.8, "-"), (2.0, ":")]:
+    denom_c = alpha_grid + BETA * d_fx
+    rx_c    = np.where(denom_c > 0, GARD_T / denom_c, np.nan)
     ax.plot(rsi_grid, np.clip(rx_c, 0, Y_MAX), color="#1f77b4",
-            linestyle=ls, linewidth=2, label=f"RxRSI @ {n_fx} fx", zorder=1)
+            linestyle=ls, linewidth=2, label=f"RxRSI @ {d_fx} Gy/fx", zorder=1)
 
 for grp in RXRSI_ORDER:
     sub = obs_rx[obs_rx["RxRSI_group"] == grp]
@@ -926,7 +769,7 @@ print("  Saved: rxrsi_spectrum_bar.png")
 print("\n=== 14. Saving outputs ===")
 
 save_cols = ["RSI", "GARD", "alpha", "GARD_cat_median", "GARD_cat_maxstat",
-             "GARD_tertile", "RxRSI", "RxRSI_group", "total_dose", "dose_match",
+             "RxRSI", "RxRSI_group", "total_dose", "dose_match",
              "dfs_months", "dfs_event", "response"]
 adata.obs[save_cols].to_csv(DATA_DIR / "results.csv")
 print(f"  Saved: results.csv  ({len(adata.obs)} patients)")

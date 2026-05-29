@@ -1,0 +1,29 @@
+# Radiosensitivity Biomarker Tutorial — Python 3.10
+# Recreate environment:
+#   uv venv --python 3.10
+#   uv pip install -r requirements.txt
+# Or with uv sync (uses pyproject.toml + uv.lock):
+#   uv sync
+
+# data fetching
+requests==2.34.2
+GEOparse==2.0.4
+
+# normalization
+rnanorm==2.2.0
+
+# core data stack
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+anndata==0.11.4
+scanpy==1.11.5
+
+# survival analysis
+lifelines==0.30.0
+statsmodels==0.14.6
+jinja2==3.1.6
+
+# plotting
+matplotlib==3.10.9
+seaborn==0.13.2
