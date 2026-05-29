@@ -518,7 +518,7 @@ def plot_km_2group(group_col, title, outpath, colors):
     for grp in (grp_a, grp_b):
         mask = df[group_col] == grp
         kmf.fit(df.loc[mask, TIME_COL], df.loc[mask, EVENT_COL], label=grp)
-        kmf.plot_survival_function(ax=ax, color=colors[grp], ci_show=True)
+        kmf.plot_survival_function(ax=ax, color=colors[grp], ci_show=False)
 
     lr = logrank_test(
         df.loc[df[group_col] == grp_a, TIME_COL], df.loc[df[group_col] == grp_b, TIME_COL],
