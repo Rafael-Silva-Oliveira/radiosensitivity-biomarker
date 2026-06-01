@@ -447,7 +447,6 @@ print("  Saved: gard_vs_rsi_scatter.png")
 print("\n=== 9. Cox modelling ===")
 
 # Build the modelling table: z-score the continuous predictors, binarize the
-# categorical GARD splits, and encode pCR as the one clinical covariate we have.
 obs_cox = adata.obs[adata.obs[TIME_COL] > 0].dropna(subset=[TIME_COL, EVENT_COL]).copy()
 obs_cox["RSI_z"]                = zscore(obs_cox["RSI"],  nan_policy="omit")
 obs_cox["GARD_z"]               = zscore(obs_cox["GARD"], nan_policy="omit")
