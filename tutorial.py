@@ -499,7 +499,6 @@ forest_plot(cox_df[cox_df["model"].str.startswith("Univariate")],
             "Univariate Cox -- DFS", FIG_DIR / "forest_univariate.png", "#4878d0")
 forest_plot(cox_df[cox_df["model"].str.startswith("Multivariate")],
             "Multivariate Cox -- DFS", FIG_DIR / "forest_multivariate.png", "#ee854a")
-print("  Saved: cox_results.csv, forest_univariate.png, forest_multivariate.png")
 
 
 # %% 10. Kaplan-Meier plots
