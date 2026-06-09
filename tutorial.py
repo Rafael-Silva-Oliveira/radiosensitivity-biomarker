@@ -443,7 +443,6 @@ print("  Saved: gard_vs_rsi_scatter.png")
 
 
 # %% 9. Cox modelling
-# ── 9. Cox modelling ───────────────────────────────────────────────────────────
 print("\n=== 9. Cox modelling ===")
 
 obs_cox = adata.obs[adata.obs[TIME_COL] > 0].dropna(subset=[TIME_COL, EVENT_COL]).copy()
