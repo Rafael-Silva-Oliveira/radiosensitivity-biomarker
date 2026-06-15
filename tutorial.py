@@ -206,7 +206,6 @@ adata.obs.rename(columns={
     "treatment_response_pcr_vs._non-pcr":   "response",
 }, inplace=True)
 
-# Coerce survival columns to numeric (some rows have "n.a.")
 adata.obs["dfs_months"] = pd.to_numeric(adata.obs["dfs_months"], errors="coerce")
 adata.obs["dfs_event"]  = pd.to_numeric(adata.obs["dfs_event"],  errors="coerce")
 
